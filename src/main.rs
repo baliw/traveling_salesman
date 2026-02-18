@@ -141,8 +141,6 @@ const WHITE: &str = "\x1b[97m";
 const MAGENTA: &str = "\x1b[35m";
 const ORANGE: &str = "\x1b[38;5;208m";
 const GRAY: &str = "\x1b[38;5;245m";
-const BG_FILL: &str = "\x1b[48;5;28m";
-const BG_EMPTY: &str = "\x1b[48;5;236m";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 /// Show cursor + restore default cursor style (blink).
 /// \x1b[?25h = DECTCEM show, \x1b[0 q = reset cursor shape to terminal default.
@@ -898,7 +896,6 @@ struct Layout {
     data_rows: usize,   // number of generation rows in the table
     map_w: usize,       // map character width
     map_h: usize,       // map character height (not counting borders)
-    bar_w: usize,       // progress bar width
 }
 
 impl Layout {
@@ -918,9 +915,8 @@ impl Layout {
         let data_rows = available.saturating_sub(map_h).max(4);
 
         let map_w = cols.saturating_sub(6); // 2 indent + 2 border + 2 margin
-        let bar_w = (cols / 5).clamp(8, 30);
 
-        Layout { cols, inner, data_rows, map_w, map_h, bar_w }
+        Layout { cols, inner, data_rows, map_w, map_h }
     }
 }
 
@@ -931,15 +927,6 @@ impl Layout {
 /// Color for pct-of-NN (lower is better).
 fn pct_color(p: f64) -> &'static str {
     if p <= 85.0 { GREEN } else if p <= 100.0 { YELLOW } else if p <= 120.0 { ORANGE } else { RED }
-}
-
-/// Progress bar: fills as pct_nn drops below 100% (lower = better).
-fn bar(pct_nn: f64, width: usize) -> String {
-    // 100% NN = empty bar, 0% NN = full bar
-    let progress = ((100.0 - pct_nn) / 100.0).clamp(0.0, 1.0);
-    let filled = (progress * width as f64).round() as usize;
-    let empty = width.saturating_sub(filled);
-    format!("{BG_FILL}{}{RESET}{BG_EMPTY}{}{RESET}", " ".repeat(filled), " ".repeat(empty))
 }
 
 fn render_map(cities: &Cities, tour: &[usize], w: usize, h: usize) -> Vec<String> {
@@ -1041,11 +1028,10 @@ fn render(
     writeln!(out, "{sep}\x1b[K").unwrap();
 
     // ── Column header ──
-    // Columns: GEN  PROGRESS  BEST%  AVG%  WORST%  DISTANCE  ms
+    // Columns: GEN  BEST%  AVG%  WORST%  DISTANCE  ms
     writeln!(
         out,
-        "  {BOLD}{WHITE} GEN   PROGRESS{bpad}  BEST%   AVG%  WORST%     DISTANCE     ms{RESET}\x1b[K",
-        bpad = " ".repeat(layout.bar_w.saturating_sub(6)),
+        "  {BOLD}{WHITE} GEN    BEST%   AVG%  WORST%     DISTANCE     ms{RESET}\x1b[K",
     ).unwrap();
     writeln!(out, "{sep}\x1b[K").unwrap();
 
@@ -1053,10 +1039,9 @@ fn render(
     let display_rows = layout.data_rows;
     let start_i = history.len().saturating_sub(display_rows);
     for stats in &history[start_i..] {
-        let b = bar(stats.best_pct_nn, layout.bar_w);
         writeln!(
             out,
-            "  {DIM}{:>4}{RESET}  {b}  {BOLD}{}{:>5.1}%{RESET}  {}{:>5.1}%{RESET}  {}{:>5.1}%{RESET}  {CYAN}{:>10.1}{RESET}  {DIM}{:>5}{RESET}\x1b[K",
+            "  {DIM}{:>4}{RESET}  {BOLD}{}{:>5.1}%{RESET}  {}{:>5.1}%{RESET}  {}{:>5.1}%{RESET}  {CYAN}{:>10.1}{RESET}  {DIM}{:>5}{RESET}\x1b[K",
             stats.generation,
             pct_color(stats.best_pct_nn), stats.best_pct_nn,
             pct_color(stats.avg_pct_nn), stats.avg_pct_nn,
