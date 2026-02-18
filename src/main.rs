@@ -1303,6 +1303,7 @@ fn main() {
     let (tc, tr) = get_terminal_size();
     let mut layout = Layout::from_terminal(tc, tr);
     let mut render_count: usize = 0;
+    let mut last_render = Instant::now();
 
     if let Some(ref gpu) = gpu_eval {
         // ═════════════════════════════════════════════════════════════════════
@@ -1437,6 +1438,7 @@ fn main() {
                 distances, tours, nc, &cities, &cfg, &mut history,
                 &mut g_best_dist, &mut g_best_tour, &mut g_best_pct,
                 gen, gen_t, &t0, nn_dist, &engine_label, &layout, &mut out,
+                &mut last_render,
             );
         }
     } else {
@@ -1483,7 +1485,7 @@ fn main() {
                 collect_stats_and_render(
                     &pop, &cities, &cfg, &mut history, &mut g_best_dist,
                     &mut g_best_tour, &mut g_best_pct, gen, gen_t, &t0, nn_dist,
-                    &engine_label, &layout, &mut out,
+                    &engine_label, &layout, &mut out, &mut last_render,
                 );
             }
         } else {
@@ -1607,7 +1609,7 @@ fn main() {
                     collect_stats_and_render(
                         &pop, &cities, &cfg, &mut history, &mut g_best_dist,
                         &mut g_best_tour, &mut g_best_pct, gen, gen_t, &t0, nn_dist,
-                        &engine_label, &layout, &mut out,
+                        &engine_label, &layout, &mut out, &mut last_render,
                     );
                 }
 
@@ -1649,6 +1651,7 @@ fn collect_stats_and_render(
     engine_label: &str,
     layout: &Layout,
     out: &mut io::StdoutLock,
+    last_render: &mut Instant,
 ) {
     let stats = compute_stats(pop);
     let avg_d = stats.sum_d / pop.len() as f64;
@@ -1673,11 +1676,15 @@ fn collect_stats_and_render(
         elapsed_ms: gen_t.elapsed().as_millis(),
     });
 
-    render(
-        out, cfg, history, cities, g_best_tour,
-        *g_best_pct, *g_best_dist, nn_dist, t0, gen == cfg.num_generations,
-        engine_label, layout,
-    );
+    let is_final = gen == cfg.num_generations;
+    if is_final || last_render.elapsed().as_millis() >= 200 {
+        render(
+            out, cfg, history, cities, g_best_tour,
+            *g_best_pct, *g_best_dist, nn_dist, t0, is_final,
+            engine_label, layout,
+        );
+        *last_render = Instant::now();
+    }
 }
 
 /// GPU mode variant — reads stats from flat f32 distance array
@@ -1700,6 +1707,7 @@ fn collect_stats_and_render_gpu(
     engine_label: &str,
     layout: &Layout,
     out: &mut io::StdoutLock,
+    last_render: &mut Instant,
 ) {
     let stats = compute_stats_flat(distances);
     let avg_d = stats.sum_d / distances.len() as f64;
@@ -1724,9 +1732,13 @@ fn collect_stats_and_render_gpu(
         elapsed_ms: gen_t.elapsed().as_millis(),
     });
 
-    render(
-        out, cfg, history, cities, g_best_tour,
-        *g_best_pct, *g_best_dist, nn_dist, t0, gen == cfg.num_generations,
-        engine_label, layout,
-    );
+    let is_final = gen == cfg.num_generations;
+    if is_final || last_render.elapsed().as_millis() >= 200 {
+        render(
+            out, cfg, history, cities, g_best_tour,
+            *g_best_pct, *g_best_dist, nn_dist, t0, is_final,
+            engine_label, layout,
+        );
+        *last_render = Instant::now();
+    }
 }
