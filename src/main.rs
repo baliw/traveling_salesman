@@ -729,7 +729,7 @@ mod gpu {
         pop_size: usize,
         num_cities: usize,
         gpu_name: String,
-        gpu_cores: u64,
+        _gpu_cores: u64,
     }
 
     impl GpuEvaluator {
@@ -793,7 +793,7 @@ mod gpu {
                 pipeline, command_queue,
                 tours_buf, city_x_buf, city_y_buf, distances_buf,
                 num_cities_buf, pop_size_buf,
-                pop_size, num_cities, gpu_name, gpu_cores,
+                pop_size, num_cities, gpu_name, _gpu_cores: gpu_cores,
             })
         }
 
@@ -1321,7 +1321,7 @@ fn main() {
                     .stack_size(2 * 1024 * 1024)
                     .name(format!("breed-{t}"))
                     .spawn_scoped(s, move || {
-                        let mut t_rng = SmallRng::seed_from_u64(42);
+                        let mut t_rng;
 
                         loop {
                             // Wait for main to set up work
