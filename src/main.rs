@@ -458,6 +458,20 @@ fn compute_stats_scalar(pop: &[Individual]) -> PopStats {
     PopStats { best_d, worst_d, sum_d, best_i }
 }
 
+/// Compute population stats from a flat f32 distance array (GPU mode).
+fn compute_stats_flat(distances: &[f32]) -> PopStats {
+    let mut best_d = f32::MAX;
+    let mut worst_d: f32 = 0.0;
+    let mut sum_d: f64 = 0.0;
+    let mut best_i = 0;
+    for (i, &d) in distances.iter().enumerate() {
+        sum_d += d as f64;
+        if d < best_d { best_d = d; best_i = i; }
+        if d > worst_d { worst_d = d; }
+    }
+    PopStats { best_d: best_d as f64, worst_d: worst_d as f64, sum_d, best_i }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn compute_stats_avx2(pop: &[Individual]) -> PopStats {
@@ -579,22 +593,99 @@ fn breed_one(pop: &[Individual], cities: &Cities, rng: &mut SmallRng) -> Individ
     Individual { tour: child_tour, distance: d }
 }
 
-/// Breed offspring on CPU but leave distance = 0 (GPU will evaluate).
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Flat-Buffer GA Operators (GPU zero-copy mode)
+//
+//  These operate on flat u32/f32 arrays stored directly in Metal buffers,
+//  eliminating the Vec<Individual> indirection and 60MB+ per-gen copies.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tournament selection from flat f32 distance array. Returns winner index.
+#[inline(always)]
+fn tournament_select_flat(distances: &[f32], rng: &mut SmallRng) -> usize {
+    let len = distances.len();
+    let mut best_idx = rng.gen_range(0..len);
+    let mut best_d = distances[best_idx];
+    for _ in 1..TOURNAMENT_SIZE {
+        let idx = rng.gen_range(0..len);
+        let d = distances[idx];
+        if d < best_d { best_d = d; best_idx = idx; }
+    }
+    best_idx
+}
+
+/// Order crossover on flat u32 tour slices.
+/// `p1`, `p2` are parent tour slices of length `n`.
+/// `child` is the destination slice (must be length `n`).
+/// `used` is a reusable scratch buffer (must be length >= `n`).
+fn order_crossover_flat(p1: &[u32], p2: &[u32], child: &mut [u32], rng: &mut SmallRng, used: &mut [bool]) {
+    let n = p1.len();
+    let (mut a, mut b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+    if a > b { std::mem::swap(&mut a, &mut b); }
+
+    used[..n].fill(false);
+    for i in a..=b { child[i] = p1[i]; used[p1[i] as usize] = true; }
+
+    let mut pos = (b + 1) % n;
+    let mut p2i = (b + 1) % n;
+    for _ in 0..(n - (b - a + 1)) {
+        while used[p2[p2i] as usize] { p2i = (p2i + 1) % n; }
+        child[pos] = p2[p2i];
+        pos = (pos + 1) % n;
+        p2i = (p2i + 1) % n;
+    }
+}
+
+/// Mutate a flat u32 tour slice in-place.
+fn mutate_flat(tour: &mut [u32], rng: &mut SmallRng) {
+    let n = tour.len();
+    match rng.gen_range(0u8..3) {
+        0 => { let i = rng.gen_range(0..n); let j = rng.gen_range(0..n); tour.swap(i, j); }
+        1 => {
+            let mut i = rng.gen_range(0..n);
+            let mut j = rng.gen_range(0..n);
+            if i > j { std::mem::swap(&mut i, &mut j); }
+            tour[i..=j].reverse();
+        }
+        _ => {
+            let i = rng.gen_range(0..n);
+            let city = tour[i];
+            // Shift left to close gap (memmove-safe)
+            if i < n - 1 { tour.copy_within(i + 1..n, i); }
+            let j = rng.gen_range(0..n - 1);
+            // Shift right to make room (memmove-safe)
+            if j < n - 1 { tour.copy_within(j..n - 1, j + 1); }
+            tour[j] = city;
+        }
+    }
+}
+
+/// Breed one offspring directly into a flat destination slice.
+/// Reads parents from `src_tours` (indexed by tournament on `distances`),
+/// writes child tour into `dest` (a slice of exactly `nc` u32s).
 #[inline(never)]
-fn breed_one_no_eval(pop: &[Individual], rng: &mut SmallRng) -> Individual {
-    let p1 = tournament_select(pop, rng);
-    let p2 = tournament_select(pop, rng);
+fn breed_one_into_dest(
+    src_tours: &[u32],
+    distances: &[f32],
+    dest: &mut [u32],
+    nc: usize,
+    rng: &mut SmallRng,
+    used_buf: &mut [bool],
+) {
+    let p1_idx = tournament_select_flat(distances, rng);
+    let p2_idx = tournament_select_flat(distances, rng);
 
-    let mut child_tour = if rng.gen::<f64>() < CROSSOVER_RATE {
-        order_crossover(&p1.tour, &p2.tour, rng)
+    let p1 = &src_tours[p1_idx * nc..(p1_idx + 1) * nc];
+    let p2 = &src_tours[p2_idx * nc..(p2_idx + 1) * nc];
+
+    if rng.gen::<f64>() < CROSSOVER_RATE {
+        order_crossover_flat(p1, p2, dest, rng, used_buf);
     } else {
-        p1.tour.clone()
-    };
+        dest.copy_from_slice(p1);
+    }
 
-    if rng.gen::<f64>() < MUTATION_RATE { mutate(&mut child_tour, rng); }
-    if rng.gen::<f64>() < DOUBLE_MUTATION_RATE { mutate(&mut child_tour, rng); }
-
-    Individual { tour: child_tour, distance: 0.0 }
+    if rng.gen::<f64>() < MUTATION_RATE { mutate_flat(dest, rng); }
+    if rng.gen::<f64>() < DOUBLE_MUTATION_RATE { mutate_flat(dest, rng); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -708,17 +799,21 @@ kernel void evaluate_tours(
 }
 "#;
 
-/// GPU evaluator — manages Metal device, pipeline, and buffers.
-/// Uses StorageModeShared for zero-copy unified memory on Apple Silicon.
+/// GPU evaluator — manages Metal device, pipeline, and dual tour buffers.
+///
+/// Zero-copy architecture: CPU breeds directly into Metal shared-memory buffers,
+/// GPU evaluates in-place. Dual tour buffers (ping-pong) allow safe concurrent
+/// reads from the "source" (last evaluated) and writes to the "destination"
+/// (next generation) without data races.
 #[cfg(target_os = "macos")]
 mod gpu {
     use metal::*;
-    use std::ffi::c_void;
+    use std::cell::Cell;
 
     pub struct GpuEvaluator {
         pipeline: ComputePipelineState,
         command_queue: CommandQueue,
-        tours_buf: Buffer,
+        tours_bufs: [Buffer; 2],    // ping-pong tour buffers
         city_x_buf: Buffer,
         city_y_buf: Buffer,
         distances_buf: Buffer,
@@ -728,6 +823,7 @@ mod gpu {
         num_cities: usize,
         gpu_name: String,
         _gpu_cores: u64,
+        current: Cell<usize>,      // index of last-evaluated tours buffer (0 or 1)
     }
 
     impl GpuEvaluator {
@@ -736,9 +832,6 @@ mod gpu {
                 .ok_or_else(|| "No Metal GPU device found".to_string())?;
 
             let gpu_name = device.name().to_string();
-
-            // M2 Ultra: registry_id-based detection isn't reliable,
-            // but we can read max_threads_per_threadgroup as a proxy.
             let gpu_cores = device.max_threads_per_threadgroup().width as u64;
 
             let options = CompileOptions::new();
@@ -760,14 +853,17 @@ mod gpu {
 
             let res_opts = MTLResourceOptions::StorageModeShared;
 
-            let tours_buf = device.new_buffer(tour_bytes, res_opts);
+            // Two tour buffers for ping-pong: CPU writes next gen to one
+            // while GPU reads current gen from the other.
+            let tours_buf_a = device.new_buffer(tour_bytes, res_opts);
+            let tours_buf_b = device.new_buffer(tour_bytes, res_opts);
             let city_x_buf = device.new_buffer(city_bytes, res_opts);
             let city_y_buf = device.new_buffer(city_bytes, res_opts);
             let distances_buf = device.new_buffer(dist_bytes, res_opts);
             let num_cities_buf = device.new_buffer(uint_bytes, res_opts);
             let pop_size_buf = device.new_buffer(uint_bytes, res_opts);
 
-            // Upload city coordinates (f64 → f32 conversion)
+            // Upload city coordinates (f64 → f32 conversion, one-time)
             {
                 let ptr = city_x_buf.contents() as *mut f32;
                 for i in 0..num_cities {
@@ -789,64 +885,81 @@ mod gpu {
 
             Ok(GpuEvaluator {
                 pipeline, command_queue,
-                tours_buf, city_x_buf, city_y_buf, distances_buf,
+                tours_bufs: [tours_buf_a, tours_buf_b],
+                city_x_buf, city_y_buf, distances_buf,
                 num_cities_buf, pop_size_buf,
                 pop_size, num_cities, gpu_name, _gpu_cores: gpu_cores,
+                current: Cell::new(0),
             })
         }
 
-        /// Evaluate all tour distances on the GPU in one dispatch.
-        ///
-        /// Uploads tour indices, dispatches compute, waits for completion,
-        /// writes distances back into the population.
-        pub fn evaluate(&self, pop: &mut [Individual]) {
-            let n = pop.len().min(self.pop_size);
+        /// Mutable slice of the "current" tour buffer — for initial population setup.
+        /// SAFETY: caller must not alias with other references to the same buffer.
+        pub unsafe fn current_tours_mut(&self) -> &mut [u32] {
+            let ptr = self.tours_bufs[self.current.get()].contents() as *mut u32;
+            std::slice::from_raw_parts_mut(ptr, self.pop_size * self.num_cities)
+        }
 
-            // ── Upload tour indices (usize → u32) into shared buffer ──
-            let ptr = self.tours_buf.contents() as *mut u32;
-            for i in 0..n {
-                let base = i * self.num_cities;
-                for j in 0..self.num_cities {
-                    unsafe { *ptr.add(base + j) = pop[i].tour[j] as u32; }
-                }
-            }
+        /// Immutable slice of the "current" (last-evaluated) tour buffer.
+        /// SAFETY: caller must ensure GPU is not writing to this buffer.
+        pub unsafe fn src_tours(&self) -> &[u32] {
+            let ptr = self.tours_bufs[self.current.get()].contents() as *const u32;
+            std::slice::from_raw_parts(ptr, self.pop_size * self.num_cities)
+        }
 
-            // ── Dispatch GPU compute ──
+        /// Mutable slice of the "next" tour buffer (destination for breeding).
+        /// SAFETY: caller must not alias with other references to the same buffer.
+        pub unsafe fn dst_tours_mut(&self) -> &mut [u32] {
+            let idx = 1 - self.current.get();
+            let ptr = self.tours_bufs[idx].contents() as *mut u32;
+            std::slice::from_raw_parts_mut(ptr, self.pop_size * self.num_cities)
+        }
+
+        /// Distances slice (valid after evaluate_current or evaluate_dst_and_swap).
+        /// SAFETY: caller must ensure GPU has completed evaluation.
+        pub unsafe fn distances(&self) -> &[f32] {
+            let ptr = self.distances_buf.contents() as *const f32;
+            std::slice::from_raw_parts(ptr, self.pop_size)
+        }
+
+        /// Evaluate the current tour buffer (used for initial population).
+        pub fn evaluate_current(&self) {
+            self.dispatch_evaluation(&self.tours_bufs[self.current.get()]);
+        }
+
+        /// Evaluate the destination buffer, then swap it to become current.
+        pub fn evaluate_dst_and_swap(&self) {
+            let dst_idx = 1 - self.current.get();
+            self.dispatch_evaluation(&self.tours_bufs[dst_idx]);
+            self.current.set(dst_idx);
+        }
+
+        /// Dispatch GPU compute on a specific tour buffer and wait for completion.
+        fn dispatch_evaluation(&self, tours_buf: &Buffer) {
             let cmd_buf = self.command_queue.new_command_buffer();
             let encoder = cmd_buf.new_compute_command_encoder();
 
             encoder.set_compute_pipeline_state(&self.pipeline);
-            encoder.set_buffer(0, Some(&self.tours_buf), 0);
+            encoder.set_buffer(0, Some(tours_buf), 0);
             encoder.set_buffer(1, Some(&self.city_x_buf), 0);
             encoder.set_buffer(2, Some(&self.city_y_buf), 0);
             encoder.set_buffer(3, Some(&self.distances_buf), 0);
             encoder.set_buffer(4, Some(&self.num_cities_buf), 0);
             encoder.set_buffer(5, Some(&self.pop_size_buf), 0);
 
-            // M2 Ultra: 256 threads/threadgroup (8 SIMD groups of 32)
-            // is optimal for this register-pressure profile.
             let tg_size = MTLSize { width: 256, height: 1, depth: 1 };
-            let grid_size = MTLSize { width: n as u64, height: 1, depth: 1 };
+            let grid_size = MTLSize { width: self.pop_size as u64, height: 1, depth: 1 };
             encoder.dispatch_threads(grid_size, tg_size);
             encoder.end_encoding();
 
             cmd_buf.commit();
             cmd_buf.wait_until_completed();
-
-            // ── Read back distances (f32 → f64) ──
-            let dist_ptr = self.distances_buf.contents() as *const f32;
-            for i in 0..n {
-                pop[i].distance = unsafe { *dist_ptr.add(i) } as f64;
-            }
         }
 
         pub fn label(&self) -> String {
             format!("Metal GPU ({})", self.gpu_name)
         }
     }
-
-    // Re-export Individual so gpu module can reference it
-    use super::Individual;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -854,14 +967,17 @@ mod gpu {
 // ═══════════════════════════════════════════════════════════════════════════════
 #[cfg(not(target_os = "macos"))]
 mod gpu {
-    use super::Individual;
-
     pub struct GpuEvaluator;
     impl GpuEvaluator {
         pub fn new(_cx: &[f64], _cy: &[f64], _pop: usize) -> Result<Self, String> {
             Err("Metal GPU requires macOS with Apple Silicon".to_string())
         }
-        pub fn evaluate(&self, _pop: &mut [Individual]) {}
+        pub unsafe fn current_tours_mut(&self) -> &mut [u32] { &mut [] }
+        pub unsafe fn src_tours(&self) -> &[u32] { &[] }
+        pub unsafe fn dst_tours_mut(&self) -> &mut [u32] { &mut [] }
+        pub unsafe fn distances(&self) -> &[f32] { &[] }
+        pub fn evaluate_current(&self) {}
+        pub fn evaluate_dst_and_swap(&self) {}
         pub fn label(&self) -> String { String::new() }
     }
 }
@@ -1168,21 +1284,6 @@ fn main() {
         }
     }
 
-    // ── Initialize population ──
-    let mut pop: Vec<Individual> = (0..cfg.pop_size)
-        .map(|_| {
-            let mut tour: Vec<usize> = (0..cfg.num_cities).collect();
-            tour.shuffle(&mut rng);
-            let distance = cities.tour_distance(&tour);
-            Individual { tour, distance }
-        })
-        .collect();
-
-    // If GPU mode, evaluate the initial population on GPU too
-    if let Some(ref g) = gpu_eval {
-        g.evaluate(&mut pop);
-    }
-
     write!(out, "{HIDE_CURSOR}\x1b[2J").unwrap();
     out.flush().unwrap();
     install_signal_handler();
@@ -1195,7 +1296,7 @@ fn main() {
     let t0 = Instant::now();
     let mut history: Vec<GenStats> = Vec::with_capacity(cfg.num_generations + 1);
     let mut g_best_dist = f64::MAX;
-    let mut g_best_tour = pop[0].tour.clone();
+    let mut g_best_tour: Vec<usize> = Vec::new();
     let mut g_best_pct = 999.0f64;
 
     // ── Dynamic terminal layout ──
@@ -1203,14 +1304,40 @@ fn main() {
     let mut layout = Layout::from_terminal(tc, tr);
     let mut render_count: usize = 0;
 
-    if cfg.num_threads <= 1 {
+    if let Some(ref gpu) = gpu_eval {
         // ═════════════════════════════════════════════════════════════════════
-        //  Single-threaded generation loop
+        //  GPU mode — zero-copy flat buffer pipeline
+        //
+        //  Population lives entirely in Metal shared-memory buffers:
+        //    tours:     [pop_size × num_cities] u32 (dual ping-pong buffers)
+        //    distances: [pop_size] f32
+        //
+        //  CPU breeds directly into buffers → GPU evaluates in-place.
+        //  No Vec<Individual>, no 60MB copy, no usize↔u32 conversions.
         // ═════════════════════════════════════════════════════════════════════
+        let nc = cfg.num_cities;
+        let ps = cfg.pop_size;
+
+        // Initialize population directly in GPU buffer (Fisher-Yates shuffle)
+        {
+            let tours = unsafe { gpu.current_tours_mut() };
+            for i in 0..ps {
+                let base = i * nc;
+                for j in 0..nc { tours[base + j] = j as u32; }
+                for j in (1..nc).rev() {
+                    let k = rng.gen_range(0..=j);
+                    tours.swap(base + j, base + k);
+                }
+            }
+        }
+        gpu.evaluate_current();
+
+        // Reusable index buffer for elite selection
+        let mut indices: Vec<usize> = (0..ps).collect();
+
         for gen in 0..=cfg.num_generations {
             let gen_t = Instant::now();
 
-            // Refresh terminal size every 10 renders
             if render_count % 10 == 0 {
                 let (tc, tr) = get_terminal_size();
                 layout = Layout::from_terminal(tc, tr);
@@ -1218,160 +1345,120 @@ fn main() {
             render_count += 1;
 
             if gen > 0 {
-                // Partition population so pop[0..elite_count] contains the best individuals
-                // They don't need to be sorted relative to each other, just separated from the rest
-                pop.select_nth_unstable_by(cfg.elite_count, |a, b|
-                    a.distance.partial_cmp(&b.distance).unwrap()
+                let distances = unsafe { gpu.distances() };
+
+                // Find elite indices via partial sort on distances
+                for (i, idx) in indices.iter_mut().enumerate() { *idx = i; }
+                indices.select_nth_unstable_by(cfg.elite_count, |&a, &b|
+                    distances[a].partial_cmp(&distances[b]).unwrap()
                 );
-                let elites: Vec<Individual> = pop[..cfg.elite_count].to_vec();
-                let offspring_count = cfg.pop_size - elites.len();
 
-                let mut next = Vec::with_capacity(cfg.pop_size);
-                next.extend(elites);
+                {
+                    let src = unsafe { gpu.src_tours() };
+                    let dst = unsafe { gpu.dst_tours_mut() };
 
-                if gpu_eval.is_some() {
-                    for _ in 0..offspring_count {
-                        next.push(breed_one_no_eval(&pop, &mut rng));
+                    // Copy elites from src to front of dst
+                    for i in 0..cfg.elite_count {
+                        let src_idx = indices[i];
+                        dst[i * nc..(i + 1) * nc]
+                            .copy_from_slice(&src[src_idx * nc..(src_idx + 1) * nc]);
                     }
-                } else {
-                    for _ in 0..offspring_count {
-                        next.push(breed_one(&pop, &cities, &mut rng));
+
+                    // Breed offspring
+                    if cfg.num_threads <= 1 {
+                        let mut used_buf = vec![false; nc];
+                        for i in cfg.elite_count..ps {
+                            let dest = &mut dst[i * nc..(i + 1) * nc];
+                            breed_one_into_dest(src, distances, dest, nc, &mut rng, &mut used_buf);
+                        }
+                    } else {
+                        // Multi-threaded breeding directly into flat GPU buffer.
+                        // Each thread writes to non-overlapping regions of dst.
+                        let offspring_count = ps - cfg.elite_count;
+                        let nt = cfg.num_threads;
+                        // Cast to usize for Send across thread::scope (standard pattern).
+                        // SAFETY: pointers remain valid for the scope's lifetime — they
+                        // come from Metal shared-memory buffers that outlive the scope.
+                        let src_addr = src.as_ptr() as usize;
+                        let dst_addr = dst.as_mut_ptr() as usize;
+                        let dist_addr = distances.as_ptr() as usize;
+                        let total_tours = ps * nc;
+
+                        std::thread::scope(|s| {
+                            let mut offset = cfg.elite_count;
+                            for t in 0..nt {
+                                let chunk = offspring_count / nt
+                                    + if t < offspring_count % nt { 1 } else { 0 };
+                                let my_start = offset;
+                                let my_end = offset + chunk;
+                                offset += chunk;
+                                let seed = rng.gen::<u64>();
+
+                                s.spawn(move || {
+                                    // SAFETY: src and dist are read-only (shared across threads).
+                                    // Each thread writes to a disjoint region of dst via raw ptr.
+                                    let src_sl = unsafe {
+                                        std::slice::from_raw_parts(
+                                            src_addr as *const u32, total_tours,
+                                        )
+                                    };
+                                    let dist_sl = unsafe {
+                                        std::slice::from_raw_parts(
+                                            dist_addr as *const f32, ps,
+                                        )
+                                    };
+                                    let mut t_rng = SmallRng::seed_from_u64(seed);
+                                    let mut used_buf = vec![false; nc];
+
+                                    for i in my_start..my_end {
+                                        let dest = unsafe {
+                                            std::slice::from_raw_parts_mut(
+                                                (dst_addr as *mut u32).add(i * nc), nc,
+                                            )
+                                        };
+                                        breed_one_into_dest(
+                                            src_sl, dist_sl, dest, nc,
+                                            &mut t_rng, &mut used_buf,
+                                        );
+                                    }
+                                });
+                            }
+                        });
                     }
                 }
-                pop = next;
 
-                if let Some(ref g) = gpu_eval {
-                    g.evaluate(&mut pop);
-                }
+                gpu.evaluate_dst_and_swap();
             }
 
-            collect_stats_and_render(
-                &pop, &cities, &cfg, &mut history, &mut g_best_dist,
-                &mut g_best_tour, &mut g_best_pct, gen, gen_t, &t0, nn_dist,
-                &engine_label, &layout, &mut out,
+            // Stats and render from flat GPU buffers
+            let distances = unsafe { gpu.distances() };
+            let tours = unsafe { gpu.src_tours() };
+            collect_stats_and_render_gpu(
+                distances, tours, nc, &cities, &cfg, &mut history,
+                &mut g_best_dist, &mut g_best_tour, &mut g_best_pct,
+                gen, gen_t, &t0, nn_dist, &engine_label, &layout, &mut out,
             );
         }
     } else {
         // ═════════════════════════════════════════════════════════════════════
-        //  Multi-threaded generation loop — persistent worker pool
-        //
-        //  Workers are created ONCE and live for the entire run. Each
-        //  generation, barriers synchronize:
-        //    1. Main sorts pop, sets shared state, hits start barrier
-        //    2. Workers wake, read shared pop ref, breed their chunk
-        //    3. Workers store results, hit end barrier
-        //    4. Main wakes, collects results, continues
-        //
-        //  Shared population reference uses UnsafeCell + barriers for
-        //  zero-overhead inter-thread communication. The barriers provide
-        //  happens-before ordering, making the UnsafeCell access sound.
+        //  CPU mode — Vec<Individual> population
         // ═════════════════════════════════════════════════════════════════════
-        let nt = cfg.num_threads;
-        let use_gpu_mode = gpu_eval.is_some();
+        let mut pop: Vec<Individual> = (0..cfg.pop_size)
+            .map(|_| {
+                let mut tour: Vec<usize> = (0..cfg.num_cities).collect();
+                tour.shuffle(&mut rng);
+                let distance = cities.tour_distance(&tour);
+                Individual { tour, distance }
+            })
+            .collect();
 
-        // Shared state: population pointer (set by main, read by workers)
-        struct SharedPopSlice {
-            ptr: std::cell::UnsafeCell<(*const Individual, usize)>,
-        }
-        unsafe impl Sync for SharedPopSlice {}
-
-        let shared_pop = SharedPopSlice {
-            ptr: std::cell::UnsafeCell::new((std::ptr::null(), 0)),
-        };
-        let start_barrier = Barrier::new(nt + 1);
-        let end_barrier = Barrier::new(nt + 1);
-        let shutdown = AtomicBool::new(false);
-
-        // Per-worker result slots (workers write, main reads after end_barrier)
-        let result_slots: Vec<Mutex<Vec<Individual>>> =
-            (0..nt).map(|_| Mutex::new(Vec::new())).collect();
-
-        // Per-worker chunk sizes and seeds (updated by main each generation)
-        let chunk_sizes: Vec<AtomicU64> = (0..nt).map(|_| AtomicU64::new(0)).collect();
-        let seeds: Vec<AtomicU64> = (0..nt).map(|_| AtomicU64::new(0)).collect();
-
-        std::thread::scope(|s| {
-            // ── Spawn persistent workers ──
-            for t in 0..nt {
-                let shared_pop = &shared_pop;
-                let start_barrier = &start_barrier;
-                let end_barrier = &end_barrier;
-                let shutdown = &shutdown;
-                let result_slot = &result_slots[t];
-                let chunk_size_atom = &chunk_sizes[t];
-                let seed_atom = &seeds[t];
-                let cities_ref = &cities;
-
-                std::thread::Builder::new()
-                    .stack_size(2 * 1024 * 1024)
-                    .name(format!("breed-{t}"))
-                    .spawn_scoped(s, move || {
-                        let mut t_rng;
-
-                        loop {
-                            // Wait for main to set up work
-                            start_barrier.wait();
-
-                            if shutdown.load(Ordering::Relaxed) {
-                                break;
-                            }
-
-                            let chunk_size = chunk_size_atom.load(Ordering::Relaxed) as usize;
-                            let seed = seed_atom.load(Ordering::Relaxed);
-                            t_rng = SmallRng::seed_from_u64(seed);
-
-                            // SAFETY: main has set the pointer before start_barrier.wait().
-                            // The barrier provides happens-before ordering. The referenced
-                            // data (pop) is not modified or deallocated until after
-                            // end_barrier.wait(), which this thread hits before returning.
-                            let (ptr, len) = unsafe { *shared_pop.ptr.get() };
-                            let pop_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-                            let mut batch = Vec::with_capacity(chunk_size);
-                            if use_gpu_mode {
-                                for _ in 0..chunk_size {
-                                    batch.push(breed_one_no_eval(pop_slice, &mut t_rng));
-                                }
-                            } else {
-                                for _ in 0..chunk_size {
-                                    batch.push(breed_one(pop_slice, cities_ref, &mut t_rng));
-                                }
-                            }
-
-                            *result_slot.lock().unwrap() = batch;
-
-                            // Signal completion
-                            end_barrier.wait();
-                        }
-                    })
-                    .expect("failed to spawn worker thread");
-            }
-
-            // ── Warmup: force per-thread malloc arena initialization ──
-            // Two cycles: first primes allocation arenas, second primes
-            // deallocation (freeing the first batch). Without this, gen 1-2
-            // pay ~800ms for glibc's per-thread arena setup.
-            for _warmup in 0..2 {
-                let warmup_count = cfg.pop_size - cfg.elite_count;
-                for t in 0..nt {
-                    let cs = warmup_count / nt
-                        + if t < warmup_count % nt { 1 } else { 0 };
-                    chunk_sizes[t].store(cs as u64, Ordering::Relaxed);
-                    seeds[t].store(rng.gen::<u64>(), Ordering::Relaxed);
-                }
-                unsafe { *shared_pop.ptr.get() = (pop.as_ptr(), pop.len()); }
-                start_barrier.wait();
-                end_barrier.wait();
-                for slot in &result_slots {
-                    slot.lock().unwrap().clear();
-                }
-            }
-
-            // ── Main generation loop (inside scope) ──
+        if cfg.num_threads <= 1 {
+            // ─────────────────────────────────────────────────────────────────
+            //  Single-threaded generation loop
+            // ─────────────────────────────────────────────────────────────────
             for gen in 0..=cfg.num_generations {
                 let gen_t = Instant::now();
 
-                // Refresh terminal size every 10 renders
                 if render_count % 10 == 0 {
                     let (tc, tr) = get_terminal_size();
                     layout = Layout::from_terminal(tc, tr);
@@ -1379,46 +1466,18 @@ fn main() {
                 render_count += 1;
 
                 if gen > 0 {
-                    // Partition population so pop[0..elite_count] contains the best individuals
-                    // They don't need to be sorted relative to each other, just separated from the rest
                     pop.select_nth_unstable_by(cfg.elite_count, |a, b|
                         a.distance.partial_cmp(&b.distance).unwrap()
                     );
                     let elites: Vec<Individual> = pop[..cfg.elite_count].to_vec();
                     let offspring_count = cfg.pop_size - elites.len();
 
-                    // Set up per-worker assignments
-                    for t in 0..nt {
-                        let cs = offspring_count / nt
-                            + if t < offspring_count % nt { 1 } else { 0 };
-                        chunk_sizes[t].store(cs as u64, Ordering::Relaxed);
-                        seeds[t].store(rng.gen::<u64>(), Ordering::Relaxed);
-                    }
-
-                    // Set shared population pointer
-                    // SAFETY: pop is valid and won't be modified until after end_barrier
-                    unsafe {
-                        *shared_pop.ptr.get() = (pop.as_ptr(), pop.len());
-                    }
-
-                    // Release workers
-                    start_barrier.wait();
-
-                    // Wait for workers to finish
-                    end_barrier.wait();
-
-                    // Collect results
                     let mut next = Vec::with_capacity(cfg.pop_size);
                     next.extend(elites);
-                    for slot in &result_slots {
-                        let mut batch = slot.lock().unwrap();
-                        next.append(&mut batch);
+                    for _ in 0..offspring_count {
+                        next.push(breed_one(&pop, &cities, &mut rng));
                     }
                     pop = next;
-
-                    if let Some(ref g) = gpu_eval {
-                        g.evaluate(&mut pop);
-                    }
                 }
 
                 collect_stats_and_render(
@@ -1427,11 +1486,135 @@ fn main() {
                     &engine_label, &layout, &mut out,
                 );
             }
+        } else {
+            // ─────────────────────────────────────────────────────────────────
+            //  Multi-threaded generation loop — persistent worker pool
+            // ─────────────────────────────────────────────────────────────────
+            let nt = cfg.num_threads;
 
-            // Signal workers to exit
-            shutdown.store(true, Ordering::Relaxed);
-            start_barrier.wait();
-        }); // scope: all workers joined here
+            struct SharedPopSlice {
+                ptr: std::cell::UnsafeCell<(*const Individual, usize)>,
+            }
+            unsafe impl Sync for SharedPopSlice {}
+
+            let shared_pop = SharedPopSlice {
+                ptr: std::cell::UnsafeCell::new((std::ptr::null(), 0)),
+            };
+            let start_barrier = Barrier::new(nt + 1);
+            let end_barrier = Barrier::new(nt + 1);
+            let shutdown = AtomicBool::new(false);
+
+            let result_slots: Vec<Mutex<Vec<Individual>>> =
+                (0..nt).map(|_| Mutex::new(Vec::new())).collect();
+            let chunk_sizes: Vec<AtomicU64> = (0..nt).map(|_| AtomicU64::new(0)).collect();
+            let seeds: Vec<AtomicU64> = (0..nt).map(|_| AtomicU64::new(0)).collect();
+
+            std::thread::scope(|s| {
+                for t in 0..nt {
+                    let shared_pop = &shared_pop;
+                    let start_barrier = &start_barrier;
+                    let end_barrier = &end_barrier;
+                    let shutdown = &shutdown;
+                    let result_slot = &result_slots[t];
+                    let chunk_size_atom = &chunk_sizes[t];
+                    let seed_atom = &seeds[t];
+                    let cities_ref = &cities;
+
+                    std::thread::Builder::new()
+                        .stack_size(2 * 1024 * 1024)
+                        .name(format!("breed-{t}"))
+                        .spawn_scoped(s, move || {
+                            let mut t_rng;
+                            loop {
+                                start_barrier.wait();
+                                if shutdown.load(Ordering::Relaxed) { break; }
+
+                                let chunk_size = chunk_size_atom.load(Ordering::Relaxed) as usize;
+                                let seed = seed_atom.load(Ordering::Relaxed);
+                                t_rng = SmallRng::seed_from_u64(seed);
+
+                                let (ptr, len) = unsafe { *shared_pop.ptr.get() };
+                                let pop_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+                                let mut batch = Vec::with_capacity(chunk_size);
+                                for _ in 0..chunk_size {
+                                    batch.push(breed_one(pop_slice, cities_ref, &mut t_rng));
+                                }
+
+                                *result_slot.lock().unwrap() = batch;
+                                end_barrier.wait();
+                            }
+                        })
+                        .expect("failed to spawn worker thread");
+                }
+
+                // Warmup: force per-thread malloc arena initialization
+                for _warmup in 0..2 {
+                    let warmup_count = cfg.pop_size - cfg.elite_count;
+                    for t in 0..nt {
+                        let cs = warmup_count / nt
+                            + if t < warmup_count % nt { 1 } else { 0 };
+                        chunk_sizes[t].store(cs as u64, Ordering::Relaxed);
+                        seeds[t].store(rng.gen::<u64>(), Ordering::Relaxed);
+                    }
+                    unsafe { *shared_pop.ptr.get() = (pop.as_ptr(), pop.len()); }
+                    start_barrier.wait();
+                    end_barrier.wait();
+                    for slot in &result_slots {
+                        slot.lock().unwrap().clear();
+                    }
+                }
+
+                for gen in 0..=cfg.num_generations {
+                    let gen_t = Instant::now();
+
+                    if render_count % 10 == 0 {
+                        let (tc, tr) = get_terminal_size();
+                        layout = Layout::from_terminal(tc, tr);
+                    }
+                    render_count += 1;
+
+                    if gen > 0 {
+                        pop.select_nth_unstable_by(cfg.elite_count, |a, b|
+                            a.distance.partial_cmp(&b.distance).unwrap()
+                        );
+                        let elites: Vec<Individual> = pop[..cfg.elite_count].to_vec();
+                        let offspring_count = cfg.pop_size - elites.len();
+
+                        for t in 0..nt {
+                            let cs = offspring_count / nt
+                                + if t < offspring_count % nt { 1 } else { 0 };
+                            chunk_sizes[t].store(cs as u64, Ordering::Relaxed);
+                            seeds[t].store(rng.gen::<u64>(), Ordering::Relaxed);
+                        }
+
+                        unsafe {
+                            *shared_pop.ptr.get() = (pop.as_ptr(), pop.len());
+                        }
+
+                        start_barrier.wait();
+                        end_barrier.wait();
+
+                        let mut next = Vec::with_capacity(cfg.pop_size);
+                        next.extend(elites);
+                        for slot in &result_slots {
+                            let mut batch = slot.lock().unwrap();
+                            next.append(&mut batch);
+                        }
+                        pop = next;
+                    }
+
+                    collect_stats_and_render(
+                        &pop, &cities, &cfg, &mut history, &mut g_best_dist,
+                        &mut g_best_tour, &mut g_best_pct, gen, gen_t, &t0, nn_dist,
+                        &engine_label, &layout, &mut out,
+                    );
+                }
+
+                shutdown.store(true, Ordering::Relaxed);
+                start_barrier.wait();
+            }); // scope: all workers joined here
+        }
     }
 
     let improvement = if nn_dist > 0.0 { (1.0 - g_best_dist / nn_dist) * 100.0 } else { 0.0 };
@@ -1478,6 +1661,57 @@ fn collect_stats_and_render(
     if stats.best_d < *g_best_dist {
         *g_best_dist = stats.best_d;
         *g_best_tour = pop[stats.best_i].tour.clone();
+        *g_best_pct = best_pct;
+    }
+
+    history.push(GenStats {
+        generation: gen,
+        best_pct_nn: best_pct,
+        worst_pct_nn: worst_pct,
+        avg_pct_nn: avg_pct,
+        best_distance: stats.best_d,
+        elapsed_ms: gen_t.elapsed().as_millis(),
+    });
+
+    render(
+        out, cfg, history, cities, g_best_tour,
+        *g_best_pct, *g_best_dist, nn_dist, t0, gen == cfg.num_generations,
+        engine_label, layout,
+    );
+}
+
+/// GPU mode variant — reads stats from flat f32 distance array
+/// and tours from flat u32 tour buffer.
+#[inline(never)]
+fn collect_stats_and_render_gpu(
+    distances: &[f32],
+    tours: &[u32],
+    nc: usize,
+    cities: &Cities,
+    cfg: &Config,
+    history: &mut Vec<GenStats>,
+    g_best_dist: &mut f64,
+    g_best_tour: &mut Vec<usize>,
+    g_best_pct: &mut f64,
+    gen: usize,
+    gen_t: Instant,
+    t0: &Instant,
+    nn_dist: f64,
+    engine_label: &str,
+    layout: &Layout,
+    out: &mut io::StdoutLock,
+) {
+    let stats = compute_stats_flat(distances);
+    let avg_d = stats.sum_d / distances.len() as f64;
+
+    let best_pct = (stats.best_d / nn_dist) * 100.0;
+    let worst_pct = (stats.worst_d / nn_dist) * 100.0;
+    let avg_pct = (avg_d / nn_dist) * 100.0;
+
+    if stats.best_d < *g_best_dist {
+        *g_best_dist = stats.best_d;
+        let base = stats.best_i * nc;
+        *g_best_tour = tours[base..base + nc].iter().map(|&c| c as usize).collect();
         *g_best_pct = best_pct;
     }
 

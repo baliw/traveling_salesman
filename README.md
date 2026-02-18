@@ -23,9 +23,10 @@ with multi-threading support, platform-specific SIMD optimizations, and optional
 │  │  Breed    │──▶│ Evaluate  │──▶│  Sort / Select   │  │
 │  │(multi-CPU)│   │ (Metal)   │   │  (CPU)           │  │
 │  └───────────┘   └───────────┘   └──────────────────┘  │
-│       ▲               ▲                                  │
-│  Parallel CPU    Metal compute shader: float4 vec'd,    │
-│  breeding        threadgroup shared mem, 256 threads/tg │
+│       ▲               ▲               ▲                  │
+│  Writes directly  Zero-copy GPU    Reads flat f32       │
+│  into Metal buf   dispatch only    distance array       │
+│  (dual ping-pong) (no upload!)     (no download!)       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -106,7 +107,11 @@ The `-t` flag enables parallel breeding across CPU threads:
 
 The `--gpu` flag offloads tour distance evaluation to the Metal GPU:
 
-- **Unified memory**: `StorageModeShared` buffers — zero-copy between CPU/GPU
+- **Zero-copy flat-buffer pipeline**: Population tours live in Metal shared-memory
+  buffers (`StorageModeShared`). CPU breeds directly into buffers, GPU evaluates
+  in-place — no upload/download copies, no `usize↔u32` conversions
+- **Dual ping-pong tour buffers**: CPU reads parents from buffer A while writing
+  children to buffer B, then GPU evaluates B and swaps
 - **Threadgroup shared memory**: City coordinates (4KB for 500 cities) loaded
   into fast threadgroup memory (~1 cycle vs ~100+ for device memory)
 - **float4 vectorization**: 4 tour legs per iteration using GPU's native float4 ALUs
@@ -114,10 +119,64 @@ The `--gpu` flag offloads tour distance evaluation to the Metal GPU:
 - **Dispatch**: 256 threads/threadgroup (8 SIMD groups of 32), up to 2048 cities
 
 ### When GPU helps most
-- **Large populations** (>50K): more parallel work saturates 76 GPU cores
-- **Large city counts** (>500): higher compute-to-transfer ratio
-- **30K pop / 500 cities**: modest 2-4× speedup (CPU SIMD is already fast)
-- **100K pop / 1000 cities**: significant GPU advantage
+- **Best with `-t N`**: GPU evaluates while CPU breeds in parallel — combine with
+  multi-threaded breeding for peak throughput
+- **Large populations** (>50K): more parallel work saturates GPU cores
+- **All sizes benefit**: Zero-copy eliminates the per-generation data copy overhead
+  (60MB at 30K pop, 200MB at 100K pop)
+
+## Performance
+
+Benchmarked on Apple M2 Ultra, 500 cities, default parameters.
+
+### 30K population, 200 generations
+
+```bash
+# CPU single-threaded (NEON+FMA)
+./target/release/ga_tsp -g 200
+# ~15s
+
+# CPU 16-threaded
+./target/release/ga_tsp -t 16 -g 200
+# 3.02s
+
+# GPU single-threaded breeding
+./target/release/ga_tsp --gpu -g 200
+# 9.56s
+
+# GPU + 16-threaded breeding
+./target/release/ga_tsp --gpu -t 16 -g 200
+# 1.18s  (2.6× faster than CPU 16T)
+```
+
+| Mode | Time | vs CPU 16T |
+|---|---|---|
+| CPU 1T | ~15s | 0.2× |
+| CPU 16T | 3.02s | 1.0× |
+| GPU 1T | 9.56s | 0.3× |
+| **GPU + 16T** | **1.18s** | **2.6×** |
+
+### 100K population, 100 generations
+
+```bash
+# CPU 16-threaded
+./target/release/ga_tsp -t 16 -p 100000 -g 100
+# 4.52s
+
+# GPU + 16-threaded breeding
+./target/release/ga_tsp --gpu -t 16 -p 100000 -g 100
+# 2.00s  (2.3× faster than CPU 16T)
+```
+
+| Mode | Time | vs CPU 16T |
+|---|---|---|
+| CPU 1T | 30.67s | 0.15× |
+| CPU 16T | 4.52s | 1.0× |
+| GPU 1T | 20.56s | 0.22× |
+| **GPU + 16T** | **2.00s** | **2.3×** |
+
+The GPU's zero-copy flat-buffer pipeline eliminates the ~60MB per-generation data copy
+(200MB at 100K pop), making `--gpu -t 16` the fastest mode at all population sizes.
 
 ## GA Parameters
 
