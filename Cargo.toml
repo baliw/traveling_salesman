@@ -1,0 +1,16 @@
+[package]
+name = "ga_tsp"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Metal GPU support — only compiled on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
